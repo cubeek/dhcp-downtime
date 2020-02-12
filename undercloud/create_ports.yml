@@ -1,0 +1,68 @@
+---
+
+- name: Create Neutron ports
+  gather_facts: no
+  hosts: undercloud
+  vars:
+    network: private1
+    start_port_index: 1
+    create_reference_port: yes
+  tasks:
+    - name: Create the reference port
+      shell: |
+        source ~/overcloudrc
+        openstack port create --network {{ network }} --host compute-0.redhat.local reference -c id -c mac_address -c fixed_ips -c name -f json
+      register: reference_port
+      when: create_reference_port | bool
+
+    - name: Create the ports
+      shell: |
+        source ~/overcloudrc
+        openstack port create --network {{ network }} --host compute-0.redhat.local port{{ item }} -c id -c mac_address -c fixed_ips -c name -f json
+      loop: "{{ range(start_port_index | int, num_ports | int + start_port_index | int ) | list }}"
+      register: port_create
+
+    - set_fact:
+        ports: "{{ ports | default([]) + [item.stdout | from_json ] }}"
+      loop: "{{ port_create.results }}"
+
+- name: Create internal OVS ports on the compute
+  gather_facts: no
+  hosts: compute-0
+  vars:
+    netmask: 24
+    default_gw: 192.168.30.1
+  tasks:
+    - name: Create OVS ports in namespaces
+      become: yes
+      vars:
+        reference_port: "{{ hostvars.undercloud.reference_port.stdout | from_json }}"
+      shell: |
+        ovs-vsctl add-port br-int {{ reference_port.name }} -- set Interface {{ reference_port.name }} type=internal -- set Interface {{ reference_port.name }} external_ids:iface-id={{ reference_port.id }}
+        ip netns add {{ reference_port.name }}
+        ip link set {{ reference_port.name }} netns {{ reference_port.name }}
+        ip netns exec {{ reference_port.name }} ip link set {{ reference_port.name }} address {{ reference_port.mac_address }} 
+        ip netns exec {{ reference_port.name }} ip link set {{ reference_port.name }} up
+      when: create_reference_port | bool
+
+    - name: Create OVS ports in namespaces
+      become: yes
+      shell: |
+        ovs-vsctl add-port br-int {{ item.name }} -- set Interface {{ item.name }} type=internal -- set Interface {{ item.name }} external_ids:iface-id={{ item.id }}
+        ip netns add {{ item.name }}
+        ip link set {{ item.name }} netns {{ item.name }}
+        ip netns exec {{ item.name }} ip link set {{ item.name }} address {{ item.mac_address }} 
+        ip netns exec {{ item.name }} ip addr add {{ item.fixed_ips[0].ip_address }}/{{ netmask }} dev {{ item.name }}
+        ip netns exec {{ item.name }} ip link set {{ item.name }} up
+        ip netns exec {{ item.name }} ip route add default via {{ default_gw }}
+      loop: "{{ hostvars.undercloud.ports }}"
+
+      #- name: Bind the ports in Neutron
+      #  gather_facts: no
+      #  hosts: undercloud
+      #  tasks:
+      #    - name: Bind the ports
+      #      shell: |
+      #        source ~/overcloudrc
+      #        openstack port set --host compute-0.redhat.local {{ item.id }}
+      #      loop: "{{ hostvars.undercloud.ports }}"
